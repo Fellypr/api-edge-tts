@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pypdf import PdfReader
 from docx import Document
 from mutagen.mp3 import MP3
@@ -42,8 +42,8 @@ TEMPO_RETENCAO_SEGUNDOS = 2 * 3600
 # ---------------------------------------------------------
 app = FastAPI(
     title="API de Geração de Audiolivro e Sincronização de Texto",
-    description="API assíncrona para extrair texto de PDF/DOCX, sintetizar áudio via Edge TTS e gerar mapa de tempo sincronizado por palavra.",
-    version="1.0.0"
+    description="API assíncrona para extrair texto de PDF/DOCX, sintetizar áudio via Edge TTS e gerar mapa de tempo sincronizado por palavra com túnel SSE de logs.",
+    version="2.0.0"
 )
 
 # Configuração de CORS para permitir requisições de qualquer front-end
@@ -54,6 +54,111 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------
+# Gerenciador de Túnel de Logs e Eventos em Tempo Real (SSE)
+# ---------------------------------------------------------
+class JobLogManager:
+    """
+    Gerencia canais de streaming SSE (Server-Sent Events) para múltiplos jobs.
+    Permite aos clientes do frontend acompanhar logs e percentuais de progresso ao vivo.
+    """
+    def __init__(self):
+        self.active_jobs: dict[str, asyncio.Queue] = {}
+        self.job_history: dict[str, list[dict]] = {}
+        self.job_status: dict[str, str] = {}
+
+    def register_job(self, job_id: str) -> asyncio.Queue:
+        queue = asyncio.Queue()
+        self.active_jobs[job_id] = queue
+        self.job_history[job_id] = []
+        self.job_status[job_id] = "processando"
+        return queue
+
+    async def broadcast(self, job_id: str, tipo: str, dados: dict):
+        evento = {
+            "tipo": tipo,
+            "job_id": job_id,
+            "tempo": time.strftime("%H:%M:%S"),
+            **dados
+        }
+        if job_id in self.job_history:
+            self.job_history[job_id].append(evento)
+        if job_id in self.active_jobs:
+            await self.active_jobs[job_id].put(evento)
+
+    async def log(self, job_id: str, mensagem: str, nivel: str = "INFO"):
+        logger.info(f"[{job_id[:8]}] {mensagem}")
+        await self.broadcast(job_id, "log", {"nivel": nivel, "mensagem": mensagem})
+
+    async def progresso(self, job_id: str, porcentagem: int, parte_atual: int, total_partes: int, mensagem: str = ""):
+        await self.broadcast(job_id, "progresso", {
+            "porcentagem": porcentagem,
+            "parte_atual": parte_atual,
+            "total_partes": total_partes,
+            "mensagem": mensagem
+        })
+
+    async def concluido(self, job_id: str, resultado: dict):
+        self.job_status[job_id] = "concluido"
+        await self.broadcast(job_id, "concluido", resultado)
+
+    async def erro(self, job_id: str, mensagem: str):
+        self.job_status[job_id] = "erro"
+        logger.error(f"[{job_id[:8]}] {mensagem}")
+        await self.broadcast(job_id, "erro", {"mensagem": mensagem})
+
+    async def stream_events(self, job_id: str):
+        """
+        Gerador assíncrono para o endpoint SSE.
+        Reproduz histórico inicial e transmite novos eventos em tempo real.
+        """
+        job_dir = STORAGE_DIR / job_id
+        arquivo_info = job_dir / "info.json"
+
+        # Se o job já concluiu anteriormente e não está mais ativo na memória
+        if job_id not in self.active_jobs and arquivo_info.exists():
+            with open(arquivo_info, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            yield f"data: {json.dumps({'tipo': 'concluido', 'job_id': job_id, 'tempo': time.strftime('%H:%M:%S'), **info}, ensure_ascii=False)}\n\n"
+            return
+
+        if job_id not in self.active_jobs and not arquivo_info.exists():
+            yield f"data: {json.dumps({'tipo': 'erro', 'job_id': job_id, 'mensagem': 'Job não encontrado ou expirado.'}, ensure_ascii=False)}\n\n"
+            return
+
+        # 1. Envia histórico de eventos já gerados antes do cliente conectar
+        historico = list(self.job_history.get(job_id, []))
+        for evt in historico:
+            yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+            if evt.get("tipo") in ("concluido", "erro"):
+                return
+
+        queue = self.active_jobs.get(job_id)
+        if not queue:
+            return
+
+        # 2. Escuta novos eventos em tempo real
+        try:
+            while True:
+                try:
+                    evento = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(evento, ensure_ascii=False)}\n\n"
+                    if evento.get("tipo") in ("concluido", "erro"):
+                        break
+                except asyncio.TimeoutError:
+                    # Keep-alive ping para evitar timeout de proxies HTTP / Hugging Face Spaces
+                    yield ": keep-alive\n\n"
+        finally:
+            # Mantém fila e histórico temporariamente para eventuais reconexões
+            pass
+
+    def cleanup(self, job_id: str):
+        self.active_jobs.pop(job_id, None)
+        self.job_history.pop(job_id, None)
+        self.job_status.pop(job_id, None)
+
+log_manager = JobLogManager()
 
 # ---------------------------------------------------------
 # Funções Auxiliares de Limpeza de Armazenamento
@@ -67,6 +172,7 @@ def limpar_arquivos_antigos():
                 idade = agora - job_folder.stat().st_mtime
                 if idade > TEMPO_RETENCAO_SEGUNDOS:
                     shutil.rmtree(job_folder, ignore_errors=True)
+                    log_manager.cleanup(job_folder.name)
                     logger.info(f"Pasta temporária expirada removida: {job_folder.name}")
     except Exception as e:
         logger.error(f"Erro ao limpar arquivos antigos: {e}")
@@ -239,7 +345,8 @@ async def gerar_parte_sincronizada(
     texto_parte: str,
     voz: str = "pt-BR-AntonioNeural",
     rate: str = "+0%",
-    pitch: str = "-5Hz"
+    pitch: str = "-5Hz",
+    job_id: Optional[str] = None
 ) -> tuple[bytes, list[dict], float]:
     """
     Sintetiza uma parte do texto com retry automático e captura eventos de WordBoundary.
@@ -276,16 +383,184 @@ async def gerar_parte_sincronizada(
 
             tempos_formatados = alinhar_pontuacao_e_paragrafos(texto_parte, tempos_brutos)
 
-            logger.info(f"Parte {indice + 1}/{total_partes} concluída ({duracao_real_bloco:.1f}s | {len(tempos_formatados)} palavras)")
+            msg = f"Parte {indice + 1}/{total_partes} concluída ({duracao_real_bloco:.1f}s | {len(tempos_formatados)} palavras)"
+            logger.info(msg)
+            if job_id:
+                await log_manager.log(job_id, msg)
+
             return bytes(audio_bytes), tempos_formatados, duracao_real_bloco
 
         except Exception as e:
-            logger.warning(f"Aviso: Tentativa {tentativa}/3 falhou para parte {indice + 1}: {e}")
+            msg_aviso = f"Aviso: Tentativa {tentativa}/3 falhou para parte {indice + 1}: {e}"
+            logger.warning(msg_aviso)
+            if job_id:
+                await log_manager.log(job_id, msg_aviso, nivel="WARNING")
             if tentativa < 3:
                 await asyncio.sleep(5)
 
-    logger.error(f"Falha definitiva ao sintetizar parte {indice + 1}")
+    msg_falha = f"Falha definitiva ao sintetizar parte {indice + 1}"
+    logger.error(msg_falha)
+    if job_id:
+        await log_manager.log(job_id, msg_falha, nivel="ERROR")
     return b"", [], 0.0
+
+# ---------------------------------------------------------
+# Tarefa de Execução do Processamento (Segundo Plano)
+# ---------------------------------------------------------
+async def executar_processamento_livro(
+    job_id: str,
+    conteudo_bytes: bytes,
+    extensao: str,
+    nome_original: str,
+    termo_cabecalho: Optional[str],
+    voz: str,
+    rate: str,
+    pitch: str,
+    tamanho_lote: int,
+    retornar_mapa_inline: bool,
+    base_url: str
+) -> dict:
+    job_dir = STORAGE_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    nome_base_livro = re.sub(r'[^\w\s-]', '', nome_original).strip().replace(' ', '_')
+    if not nome_base_livro:
+        nome_base_livro = "audiolivro"
+
+    arquivo_mp3 = job_dir / f"{nome_base_livro}_Audiolivro.mp3"
+    arquivo_mapa = job_dir / f"{nome_base_livro}_MapaDoTempo.json"
+    arquivo_info = job_dir / "info.json"
+
+    download_audio_url = f"{base_url}/download/{job_id}/audio"
+    download_mapa_url = f"{base_url}/download/{job_id}/mapa"
+
+    try:
+        await log_manager.log(job_id, f"Iniciando processamento do livro '{nome_original}'")
+        await log_manager.progresso(job_id, porcentagem=5, parte_atual=0, total_partes=0, mensagem="Extraindo texto do documento...")
+
+        # 1. Extração do texto
+        if extensao == ".pdf":
+            paragrafos_originais = extrair_texto_pdf(conteudo_bytes, termo_cabecalho)
+        else:
+            paragrafos_originais = extrair_texto_docx(conteudo_bytes)
+
+        if not paragrafos_originais:
+            raise ValueError("Nenhum texto legível foi encontrado no arquivo fornecido.")
+
+        await log_manager.log(job_id, f"Extração concluída: {len(paragrafos_originais)} parágrafos encontrados.")
+        await log_manager.progresso(job_id, porcentagem=15, parte_atual=0, total_partes=0, mensagem="Dividindo texto em partes otimizadas...")
+
+        # 2. Divisão em lotes
+        partes = agrupar_em_lotes(paragrafos_originais, tamanho_lote=tamanho_lote)
+        total_partes = len(partes)
+        await log_manager.log(job_id, f"Texto estruturado e dividido em {total_partes} partes para síntese neural.")
+
+        # 3. Processamento e síntese assíncrona
+        mapa_completo = []
+        tempo_acumulado = 0.0
+        tamanho_grupo = 3
+
+        with open(arquivo_mp3, "wb") as f_mp3:
+            for i in range(0, total_partes, tamanho_grupo):
+                fim_grupo = min(i + tamanho_grupo, total_partes)
+                await log_manager.log(job_id, f"Processando lote de partes {i + 1} até {fim_grupo} de {total_partes}...")
+
+                tarefas = [
+                    gerar_parte_sincronizada(
+                        indice=i + j,
+                        total_partes=total_partes,
+                        texto_parte=texto,
+                        voz=voz,
+                        rate=rate,
+                        pitch=pitch,
+                        job_id=job_id
+                    )
+                    for j, texto in enumerate(partes[i : fim_grupo])
+                ]
+
+                resultados = await asyncio.gather(*tarefas)
+
+                for audio_bytes, tempos_parte, duracao_bloco in resultados:
+                    if not audio_bytes:
+                        continue
+
+                    f_mp3.write(audio_bytes)
+
+                    for item in tempos_parte:
+                        mapa_completo.append({
+                            "p": item["palavra"],
+                            "i": round(item["inicio"] + tempo_acumulado, 3),
+                            "f": round(item["fim"] + tempo_acumulado, 3)
+                        })
+
+                    tempo_acumulado += duracao_bloco
+
+                porcentagem_calculada = int(20 + (fim_grupo / total_partes) * 70)
+                await log_manager.progresso(
+                    job_id=job_id,
+                    porcentagem=porcentagem_calculada,
+                    parte_atual=fim_grupo,
+                    total_partes=total_partes,
+                    mensagem=f"Sintetizadas {fim_grupo} de {total_partes} partes ({tempo_acumulado:.1f}s acumulados)"
+                )
+
+                if fim_grupo < total_partes:
+                    await log_manager.log(job_id, "Aguardando 5 segundos para respeitar limites do serviço Edge-TTS...")
+                    await asyncio.sleep(5)
+
+        # Salva o mapa sincronizado em JSON
+        await log_manager.log(job_id, "Salvando mapa temporal de sincronização e consolidando arquivos...")
+        await log_manager.progresso(job_id, porcentagem=95, parte_atual=total_partes, total_partes=total_partes, mensagem="Consolidando arquivos...")
+
+        with open(arquivo_mapa, "w", encoding="utf-8") as f_json:
+            json.dump(mapa_completo, f_json, ensure_ascii=False, indent=2)
+
+        info_job = {
+            "status": "sucesso",
+            "job_id": job_id,
+            "nome_livro": nome_base_livro,
+            "arquivo_original": nome_original,
+            "duracao_segundos": round(tempo_acumulado, 2),
+            "duracao_minutos": round(tempo_acumulado / 60, 2),
+            "total_paragrafos": len(paragrafos_originais),
+            "total_partes": total_partes,
+            "total_palavras": len(mapa_completo),
+            "criado_em": time.time(),
+            "download_audio_url": download_audio_url,
+            "download_mapa_url": download_mapa_url,
+            "mp3_nome": arquivo_mp3.name,
+            "json_nome": arquivo_mapa.name
+        }
+
+        with open(arquivo_info, "w", encoding="utf-8") as f_info:
+            json.dump(info_job, f_info, ensure_ascii=False, indent=2)
+
+        resposta = {
+            "status": "sucesso",
+            "job_id": job_id,
+            "nome_livro": nome_base_livro,
+            "duracao_segundos": round(tempo_acumulado, 2),
+            "duracao_minutos": round(tempo_acumulado / 60, 2),
+            "total_paragrafos": len(paragrafos_originais),
+            "total_partes": total_partes,
+            "total_palavras": len(mapa_completo),
+            "download_audio_url": download_audio_url,
+            "download_mapa_url": download_mapa_url
+        }
+
+        if retornar_mapa_inline:
+            resposta["mapa"] = mapa_completo
+
+        await log_manager.log(job_id, f"Processamento concluído com sucesso! Duração total: {round(tempo_acumulado / 60, 2)} min.")
+        await log_manager.progresso(job_id, porcentagem=100, parte_atual=total_partes, total_partes=total_partes, mensagem="Audiolivro e mapa gerados com sucesso!")
+        await log_manager.concluido(job_id, resposta)
+        return resposta
+
+    except Exception as e:
+        logger.error(f"Erro durante o processamento do job {job_id}: {e}")
+        shutil.rmtree(job_dir, ignore_errors=True)
+        await log_manager.erro(job_id, f"Erro durante o processamento: {str(e)}")
+        raise e
 
 # ---------------------------------------------------------
 # Endpoints da API
@@ -295,6 +570,7 @@ def root():
     return {
         "status": "online",
         "api": "Gerador de Audiolivro e Sincronizacao de Texto",
+        "versao": "2.0.0",
         "docs": "/docs",
         "health": "/health",
         "vozes": "/vozes"
@@ -327,12 +603,13 @@ async def processar_livro(
     rate: str = Form("+0%", description="Taxa de velocidade (ex: +0%, +10%, -5%)"),
     pitch: str = Form("-5Hz", description="Ajuste de tom (ex: -5Hz, +0Hz)"),
     tamanho_lote: int = Form(10000, description="Tamanho máximo de caracteres por lote"),
-    retornar_mapa_inline: bool = Form(False, description="Se True, inclui a lista completa de palavras e tempos diretamente no JSON de resposta")
+    retornar_mapa_inline: bool = Form(False, description="Se True, inclui a lista completa de palavras e tempos diretamente no JSON de resposta"),
+    sync: bool = Form(False, description="Se True, aguarda a conclusão antes de responder (modo bloqueante). Se False (padrão), retorna job_id imediatamente para streaming via SSE.")
 ):
     """
     Recebe um arquivo PDF ou DOCX, extrai e limpa o texto,
-    sintetiza a narração sincronizada via Edge-TTS e retorna
-    as URLs para download do áudio .mp3 e mapa .json.
+    sintetiza a narração sincronizada via Edge-TTS e transmite
+    logs/progresso em tempo real via SSE.
     """
     extensao = Path(file.filename or "").suffix.lower()
     if extensao not in [".pdf", ".docx"]:
@@ -341,145 +618,78 @@ async def processar_livro(
             detail="Formato de arquivo não suportado. Envie um arquivo .pdf ou .docx."
         )
 
-    # Limpeza de background periódica
-    background_tasks.add_task(limpar_arquivos_antigos)
-
-    # Gera identificador único e diretório para o job
-    job_id = uuid.uuid4().hex
-    job_dir = STORAGE_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
-    # Sanitiza o nome base do livro
-    nome_original = Path(file.filename or "livro").stem
-    nome_base_livro = re.sub(r'[^\w\s-]', '', nome_original).strip().replace(' ', '_')
-    if not nome_base_livro:
-        nome_base_livro = "audiolivro"
-
-    logger.info(f"Iniciando processamento do livro '{nome_original}' (Job ID: {job_id})")
-
-    # Lê o conteúdo do arquivo enviado
     conteudo_bytes = await file.read()
     if not conteudo_bytes:
         raise HTTPException(status_code=400, detail="O arquivo enviado está vazio.")
 
-    # 1. Extração do texto
-    try:
-        if extensao == ".pdf":
-            paragrafos_originais = extrair_texto_pdf(conteudo_bytes, termo_cabecalho)
-        else:
-            paragrafos_originais = extrair_texto_docx(conteudo_bytes)
-    except Exception as e:
-        logger.error(f"Erro ao extrair texto do arquivo: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao processar o arquivo: {str(e)}")
+    # Limpeza periódica de armazenamento
+    background_tasks.add_task(limpar_arquivos_antigos)
 
-    if not paragrafos_originais:
-        raise HTTPException(
-            status_code=400,
-            detail="Nenhum texto legível foi encontrado no arquivo fornecido."
+    # Identificador único do job
+    job_id = uuid.uuid4().hex
+    nome_original = Path(file.filename or "livro").stem
+    base_url = str(request.base_url).rstrip("/")
+
+    # Registra o job no gerenciador de streaming
+    log_manager.register_job(job_id)
+
+    if sync:
+        # Modo bloqueante legado
+        return await executar_processamento_livro(
+            job_id=job_id,
+            conteudo_bytes=conteudo_bytes,
+            extensao=extensao,
+            nome_original=nome_original,
+            termo_cabecalho=termo_cabecalho,
+            voz=voz,
+            rate=rate,
+            pitch=pitch,
+            tamanho_lote=tamanho_lote,
+            retornar_mapa_inline=retornar_mapa_inline,
+            base_url=base_url
         )
 
-    # 2. Divisão em lotes
-    partes = agrupar_em_lotes(paragrafos_originais, tamanho_lote=tamanho_lote)
-    total_partes = len(partes)
-    logger.info(f"Livro estruturado em {len(paragrafos_originais)} parágrafos e dividido em {total_partes} partes.")
+    # Modo assíncrono padrão com streaming SSE
+    asyncio.create_task(
+        executar_processamento_livro(
+            job_id=job_id,
+            conteudo_bytes=conteudo_bytes,
+            extensao=extensao,
+            nome_original=nome_original,
+            termo_cabecalho=termo_cabecalho,
+            voz=voz,
+            rate=rate,
+            pitch=pitch,
+            tamanho_lote=tamanho_lote,
+            retornar_mapa_inline=retornar_mapa_inline,
+            base_url=base_url
+        )
+    )
 
-    # 3. Processamento e síntese assíncrona
-    arquivo_mp3 = job_dir / f"{nome_base_livro}_Audiolivro.mp3"
-    arquivo_mapa = job_dir / f"{nome_base_livro}_MapaDoTempo.json"
-    arquivo_info = job_dir / "info.json"
-
-    mapa_completo = []
-    tempo_acumulado = 0.0
-    tamanho_grupo = 3
-
-    try:
-        with open(arquivo_mp3, "wb") as f_mp3:
-            for i in range(0, total_partes, tamanho_grupo):
-                lote = partes[i : i + tamanho_grupo]
-                logger.info(f"Processando lote de partes {i + 1} até {min(i + tamanho_grupo, total_partes)}...")
-
-                tarefas = [
-                    gerar_parte_sincronizada(
-                        indice=i + j,
-                        total_partes=total_partes,
-                        texto_parte=texto,
-                        voz=voz,
-                        rate=rate,
-                        pitch=pitch
-                    )
-                    for j, texto in enumerate(lote)
-                ]
-
-                resultados = await asyncio.gather(*tarefas)
-
-                for audio_bytes, tempos_parte, duracao_bloco in resultados:
-                    if not audio_bytes:
-                        continue
-
-                    f_mp3.write(audio_bytes)
-
-                    for item in tempos_parte:
-                        mapa_completo.append({
-                            "p": item["palavra"],
-                            "i": round(item["inicio"] + tempo_acumulado, 3),
-                            "f": round(item["fim"] + tempo_acumulado, 3)
-                        })
-
-                    tempo_acumulado += duracao_bloco
-
-                # Pausa para respeitar limites de requisição do Edge-TTS
-                if i + tamanho_grupo < total_partes:
-                    await asyncio.sleep(5)
-
-        # Salva o mapa sincronizado em JSON
-        with open(arquivo_mapa, "w", encoding="utf-8") as f_json:
-            json.dump(mapa_completo, f_json, ensure_ascii=False, indent=2)
-
-    except Exception as e:
-        logger.error(f"Erro durante a síntese de áudio: {e}")
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"Erro durante a síntese de áudio: {str(e)}")
-
-    # Salva informações do job
-    info_job = {
+    return {
+        "status": "iniciado",
         "job_id": job_id,
-        "nome_livro": nome_base_livro,
-        "arquivo_original": file.filename,
-        "duracao_segundos": round(tempo_acumulado, 2),
-        "duracao_minutos": round(tempo_acumulado / 60, 2),
-        "total_paragrafos": len(paragrafos_originais),
-        "total_partes": total_partes,
-        "total_palavras": len(mapa_completo),
-        "criado_em": time.time(),
-        "mp3_nome": arquivo_mp3.name,
-        "json_nome": arquivo_mapa.name
+        "stream_url": f"{base_url}/jobs/{job_id}/stream",
+        "status_url": f"{base_url}/status/{job_id}",
+        "download_audio_url": f"{base_url}/download/{job_id}/audio",
+        "download_mapa_url": f"{base_url}/download/{job_id}/mapa"
     }
 
-    with open(arquivo_info, "w", encoding="utf-8") as f_info:
-        json.dump(info_job, f_info, ensure_ascii=False, indent=2)
-
-    # Constrói URLs base dinamicamente com base no request atual
-    base_url = str(request.base_url).rstrip("/")
-    download_audio_url = f"{base_url}/download/{job_id}/audio"
-    download_mapa_url = f"{base_url}/download/{job_id}/mapa"
-
-    resposta = {
-        "status": "sucesso",
-        "job_id": job_id,
-        "nome_livro": nome_base_livro,
-        "duracao_segundos": round(tempo_acumulado, 2),
-        "duracao_minutos": round(tempo_acumulado / 60, 2),
-        "total_paragrafos": len(paragrafos_originais),
-        "total_partes": total_partes,
-        "total_palavras": len(mapa_completo),
-        "download_audio_url": download_audio_url,
-        "download_mapa_url": download_mapa_url
-    }
-
-    if retornar_mapa_inline:
-        resposta["mapa"] = mapa_completo
-
-    return resposta
+@app.get("/jobs/{job_id}/stream", tags=["Streaming"])
+async def stream_logs_job(job_id: str):
+    """
+    Túnel SSE (Server-Sent Events) para transmissão em tempo real
+    dos logs e porcentagem de progresso de um job específico.
+    """
+    return StreamingResponse(
+        log_manager.stream_events(job_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 @app.get("/download/{job_id}/audio", tags=["Download"])
 def baixar_audio(job_id: str):
@@ -519,15 +729,23 @@ def baixar_mapa(job_id: str):
 
 @app.get("/status/{job_id}", tags=["Status"])
 def status_job(job_id: str):
-    """Consulta os metadados de um processamento específico."""
+    """Consulta os metadados ou status atual de um processamento específico."""
     job_dir = STORAGE_DIR / job_id
     arquivo_info = job_dir / "info.json"
 
-    if not arquivo_info.exists():
-        raise HTTPException(status_code=404, detail="Job não encontrado ou expirado.")
+    if arquivo_info.exists():
+        with open(arquivo_info, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+            return {"status": "concluido", **dados}
 
-    with open(arquivo_info, "r", encoding="utf-8") as f:
-        return json.load(f)
+    if job_id in log_manager.active_jobs or job_id in log_manager.job_history:
+        return {
+            "status": log_manager.job_status.get(job_id, "processando"),
+            "job_id": job_id,
+            "logs_recentes": log_manager.job_history.get(job_id, [])[-15:]
+        }
+
+    raise HTTPException(status_code=404, detail="Job não encontrado ou expirado.")
 
 if __name__ == "__main__":
     import uvicorn
