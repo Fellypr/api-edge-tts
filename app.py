@@ -487,13 +487,24 @@ async def executar_processamento_livro(
                     f_mp3.write(audio_bytes)
 
                     for item in tempos_parte:
+                        inicio_ajustado = round(item["inicio"] + tempo_acumulado, 3)
+                        fim_ajustado = round(item["fim"] + tempo_acumulado, 3)
+
+                        if mapa_completo:
+                            # Garante monotonicidade: o tempo 'i' nunca pode ser menor que o anterior
+                            if inicio_ajustado < mapa_completo[-1]["i"]:
+                                inicio_ajustado = mapa_completo[-1]["i"]
+                            if fim_ajustado < inicio_ajustado:
+                                fim_ajustado = inicio_ajustado
+
                         mapa_completo.append({
                             "p": item["palavra"],
-                            "i": round(item["inicio"] + tempo_acumulado, 3),
-                            "f": round(item["fim"] + tempo_acumulado, 3)
+                            "i": inicio_ajustado,
+                            "f": fim_ajustado
                         })
 
-                    tempo_acumulado += duracao_bloco
+                    ultimo_fim = mapa_completo[-1]["f"] if mapa_completo else 0.0
+                    tempo_acumulado = max(round(tempo_acumulado + duracao_bloco, 3), ultimo_fim)
 
                 porcentagem_calculada = int(20 + (fim_grupo / total_partes) * 70)
                 await log_manager.progresso(
@@ -628,7 +639,8 @@ async def processar_livro(
     # Identificador único do job
     job_id = uuid.uuid4().hex
     nome_original = Path(file.filename or "livro").stem
-    base_url = str(request.base_url).rstrip("/")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    base_url = f"{proto}://{request.url.netloc}".rstrip("/")
 
     # Registra o job no gerenciador de streaming
     log_manager.register_job(job_id)
