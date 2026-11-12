@@ -8,7 +8,7 @@ import shutil
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -180,18 +180,34 @@ def limpar_arquivos_antigos():
 # ---------------------------------------------------------
 # Extração e Limpeza de Textos
 # ---------------------------------------------------------
-def extrair_texto_pdf(conteudo_bytes: bytes, termo_cabecalho: Optional[str] = None) -> list[str]:
+def extrair_texto_pdf(
+    origem: Union[str, Path, bytes],
+    termo_cabecalho: Optional[str] = None,
+    pagina_inicial: Optional[int] = None,
+    pagina_final: Optional[int] = None
+) -> list[str]:
     """
-    Lê o PDF e aplica filtros inteligentes:
+    Lê o PDF (a partir de arquivo em disco ou bytes) e aplica filtros inteligentes:
+    - Lê direto do disco via streaming do PdfReader para evitar estouro de memória RAM
+    - Permite processar livros extensos limitando ou não por páginas (pagina_inicial, pagina_final)
     - Remove números de página soltos
     - Remove cabeçalhos repetitivos
     - Agrupa em frases e parágrafos fluidos
     """
     paragrafos_originais = []
-    leitor = PdfReader(io.BytesIO(conteudo_bytes))
-    termo_filtro = termo_cabecalho.strip().lower() if termo_cabecalho else None
+    if isinstance(origem, (str, Path)):
+        leitor = PdfReader(str(origem))
+    else:
+        leitor = PdfReader(io.BytesIO(origem))
 
-    for pagina in leitor.pages:
+    termo_filtro = termo_cabecalho.strip().lower() if termo_cabecalho else None
+    total_paginas = len(leitor.pages)
+
+    idx_inicio = max(0, (pagina_inicial - 1)) if (pagina_inicial and pagina_inicial > 0) else 0
+    idx_fim = min(total_paginas, pagina_final) if (pagina_final and pagina_final > 0) else total_paginas
+
+    for num_pag in range(idx_inicio, idx_fim):
+        pagina = leitor.pages[num_pag]
         t = pagina.extract_text()
         if not t:
             continue
@@ -234,12 +250,15 @@ def extrair_texto_pdf(conteudo_bytes: bytes, termo_cabecalho: Optional[str] = No
 
     return paragrafos_originais
 
-def extrair_texto_docx(conteudo_bytes: bytes) -> list[str]:
+def extrair_texto_docx(origem: Union[str, Path, bytes]) -> list[str]:
     """
-    Lê o documento Word (.docx) e extrai parágrafos e células de tabelas.
+    Lê o documento Word (.docx) a partir de arquivo em disco ou bytes e extrai parágrafos e células de tabelas.
     """
     paragrafos_originais = []
-    doc = Document(io.BytesIO(conteudo_bytes))
+    if isinstance(origem, (str, Path)):
+        doc = Document(str(origem))
+    else:
+        doc = Document(io.BytesIO(origem))
 
     for p in doc.paragraphs:
         texto = p.text.strip()
@@ -349,9 +368,13 @@ async def gerar_parte_sincronizada(
     job_id: Optional[str] = None
 ) -> tuple[bytes, list[dict], float]:
     """
-    Sintetiza uma parte do texto com retry automático e captura eventos de WordBoundary.
+    Sintetiza uma parte do texto com retry automático e backoff progressivo,
+    capturando eventos de WordBoundary.
     """
-    for tentativa in range(1, 4):
+    intervalos_retry = [2, 5, 10, 15]
+    total_tentativas = len(intervalos_retry) + 1
+
+    for tentativa in range(1, total_tentativas + 1):
         try:
             comunicador = edge_tts.Communicate(
                 text=texto_parte,
@@ -391,14 +414,15 @@ async def gerar_parte_sincronizada(
             return bytes(audio_bytes), tempos_formatados, duracao_real_bloco
 
         except Exception as e:
-            msg_aviso = f"Aviso: Tentativa {tentativa}/3 falhou para parte {indice + 1}: {e}"
+            espera = intervalos_retry[tentativa - 1] if tentativa <= len(intervalos_retry) else 15
+            msg_aviso = f"Aviso: Tentativa {tentativa}/{total_tentativas} falhou para parte {indice + 1}: {e}. Nova tentativa em {espera}s..."
             logger.warning(msg_aviso)
             if job_id:
                 await log_manager.log(job_id, msg_aviso, nivel="WARNING")
-            if tentativa < 3:
-                await asyncio.sleep(5)
+            if tentativa < total_tentativas:
+                await asyncio.sleep(espera)
 
-    msg_falha = f"Falha definitiva ao sintetizar parte {indice + 1}"
+    msg_falha = f"Falha definitiva ao sintetizar parte {indice + 1} após {total_tentativas} tentativas."
     logger.error(msg_falha)
     if job_id:
         await log_manager.log(job_id, msg_falha, nivel="ERROR")
@@ -409,7 +433,7 @@ async def gerar_parte_sincronizada(
 # ---------------------------------------------------------
 async def executar_processamento_livro(
     job_id: str,
-    conteudo_bytes: bytes,
+    origem: Union[Path, bytes],
     extensao: str,
     nome_original: str,
     termo_cabecalho: Optional[str],
@@ -418,7 +442,9 @@ async def executar_processamento_livro(
     pitch: str,
     tamanho_lote: int,
     retornar_mapa_inline: bool,
-    base_url: str
+    base_url: str,
+    pagina_inicial: Optional[int] = None,
+    pagina_final: Optional[int] = None
 ) -> dict:
     job_dir = STORAGE_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -438,11 +464,20 @@ async def executar_processamento_livro(
         await log_manager.log(job_id, f"Iniciando processamento do livro '{nome_original}'")
         await log_manager.progresso(job_id, porcentagem=5, parte_atual=0, total_partes=0, mensagem="Extraindo texto do documento...")
 
-        # 1. Extração do texto
+        # 1. Extração do texto (com suporte a streaming direto de arquivo em disco)
         if extensao == ".pdf":
-            paragrafos_originais = extrair_texto_pdf(conteudo_bytes, termo_cabecalho)
+            paragrafos_originais = extrair_texto_pdf(
+                origem,
+                termo_cabecalho=termo_cabecalho,
+                pagina_inicial=pagina_inicial,
+                pagina_final=pagina_final
+            )
         else:
-            paragrafos_originais = extrair_texto_docx(conteudo_bytes)
+            paragrafos_originais = extrair_texto_docx(origem)
+
+        # Remove o arquivo temporário de upload para liberar disco imediatamente
+        if isinstance(origem, Path) and origem.exists():
+            origem.unlink(missing_ok=True)
 
         if not paragrafos_originais:
             raise ValueError("Nenhum texto legível foi encontrado no arquivo fornecido.")
@@ -572,6 +607,9 @@ async def executar_processamento_livro(
         shutil.rmtree(job_dir, ignore_errors=True)
         await log_manager.erro(job_id, f"Erro durante o processamento: {str(e)}")
         raise e
+    finally:
+        if isinstance(origem, Path) and origem.exists():
+            origem.unlink(missing_ok=True)
 
 # ---------------------------------------------------------
 # Endpoints da API
@@ -610,6 +648,8 @@ async def processar_livro(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Arquivo .pdf ou .docx do livro/documento"),
     termo_cabecalho: Optional[str] = Form(None, description="Cabeçalho ou termo recorrente a ignorar (opcional)"),
+    pagina_inicial: Optional[int] = Form(None, description="Página inicial para processamento (opcional, 1-based)"),
+    pagina_final: Optional[int] = Form(None, description="Página final para processamento (opcional, 1-based)"),
     voz: str = Form("pt-BR-AntonioNeural", description="Voz do Edge-TTS"),
     rate: str = Form("+0%", description="Taxa de velocidade (ex: +0%, +10%, -5%)"),
     pitch: str = Form("-5Hz", description="Ajuste de tom (ex: -5Hz, +0Hz)"),
@@ -618,9 +658,9 @@ async def processar_livro(
     sync: bool = Form(False, description="Se True, aguarda a conclusão antes de responder (modo bloqueante). Se False (padrão), retorna job_id imediatamente para streaming via SSE.")
 ):
     """
-    Recebe um arquivo PDF ou DOCX, extrai e limpa o texto,
-    sintetiza a narração sincronizada via Edge-TTS e transmite
-    logs/progresso em tempo real via SSE.
+    Recebe um arquivo PDF ou DOCX, extrai e limpa o texto com suporte a streaming de disco
+    (para livros e PDFs extensos sem sobrecarga de memória RAM), sintetiza a narração
+    sincronizada via Edge-TTS com retry exponencial e transmite logs/progresso em tempo real via SSE.
     """
     extensao = Path(file.filename or "").suffix.lower()
     if extensao not in [".pdf", ".docx"]:
@@ -629,8 +669,25 @@ async def processar_livro(
             detail="Formato de arquivo não suportado. Envie um arquivo .pdf ou .docx."
         )
 
-    conteudo_bytes = await file.read()
-    if not conteudo_bytes:
+    # Identificador único do job e diretório dedicado
+    job_id = uuid.uuid4().hex
+    job_dir = STORAGE_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    caminho_arquivo = job_dir / f"upload_{file.filename or 'documento'}"
+
+    # Salva o arquivo em disco em chunks para evitar estourar a memória RAM com PDFs grandes
+    tamanho_total = 0
+    with open(caminho_arquivo, "wb") as buffer:
+        while chunk := await file.read(1024 * 1024):  # 1MB por chunk
+            tamanho_total += len(chunk)
+            buffer.write(chunk)
+
+    if tamanho_total == 0:
+        caminho_arquivo.unlink(missing_ok=True)
+        try:
+            job_dir.rmdir()
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail="O arquivo enviado está vazio.")
 
     # Limpeza periódica de armazenamento
@@ -649,7 +706,7 @@ async def processar_livro(
         # Modo bloqueante legado
         return await executar_processamento_livro(
             job_id=job_id,
-            conteudo_bytes=conteudo_bytes,
+            origem=caminho_arquivo,
             extensao=extensao,
             nome_original=nome_original,
             termo_cabecalho=termo_cabecalho,
@@ -658,14 +715,16 @@ async def processar_livro(
             pitch=pitch,
             tamanho_lote=tamanho_lote,
             retornar_mapa_inline=retornar_mapa_inline,
-            base_url=base_url
+            base_url=base_url,
+            pagina_inicial=pagina_inicial,
+            pagina_final=pagina_final
         )
 
     # Modo assíncrono padrão com streaming SSE
     asyncio.create_task(
         executar_processamento_livro(
             job_id=job_id,
-            conteudo_bytes=conteudo_bytes,
+            origem=caminho_arquivo,
             extensao=extensao,
             nome_original=nome_original,
             termo_cabecalho=termo_cabecalho,
@@ -674,7 +733,9 @@ async def processar_livro(
             pitch=pitch,
             tamanho_lote=tamanho_lote,
             retornar_mapa_inline=retornar_mapa_inline,
-            base_url=base_url
+            base_url=base_url,
+            pagina_inicial=pagina_inicial,
+            pagina_final=pagina_final
         )
     )
 
