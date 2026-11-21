@@ -373,6 +373,10 @@ def alinhar_pontuacao_e_paragrafos(texto_com_formatacao: str, tempos_brutos: lis
 
     return mapa_alinhado
 
+# Configurações de Macro-Blocos e Resfriamento (Cooldown)
+TAMANHO_MACRO_BLOCO = 30         # 30 partes por bloco (~1h30 de áudio)
+TEMPO_COOLDOWN_SEGUNDOS = 120    # 2 minutos de descanso entre blocos para zerar rate-limit da Microsoft
+
 # Diretório de Cache Global para Chunks Sintetizados
 CACHE_TTS_DIR = STORAGE_DIR / ".cache_tts"
 CACHE_TTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -563,74 +567,94 @@ async def executar_processamento_livro(
         semaforo_tts = asyncio.Semaphore(2)  # Máximo de 2 conexões concorrentes para evitar 429/timeout
         tamanho_grupo = 2
 
-        # Ponto de liberação antecipada (Play While Processing):
-        # Libera após as primeiras 6 partes (~18.000 caracteres / ~20-25 min de áudio em ~45s)
-        limiar_liberacao = min(6, total_partes)
-        ja_liberou_parcial = False
+        # Organização em Macro-Blocos de até TAMANHO_MACRO_BLOCO partes com Cooldown
+        total_blocos = (total_partes + TAMANHO_MACRO_BLOCO - 1) // TAMANHO_MACRO_BLOCO
+        await log_manager.log(job_id, f"Texto estruturado em {total_partes} partes organizadas em {total_blocos} macro-blocos de até {TAMANHO_MACRO_BLOCO} partes com pausas programadas de resfriamento.")
 
         with open(arquivo_mp3, "wb") as f_mp3:
-            for i in range(0, total_partes, tamanho_grupo):
-                fim_grupo = min(i + tamanho_grupo, total_partes)
-                await log_manager.log(job_id, f"Processando lote de partes {i + 1} até {fim_grupo} de {total_partes}...")
+            for b_idx in range(total_blocos):
+                inicio_bloco = b_idx * TAMANHO_MACRO_BLOCO
+                fim_bloco = min(inicio_bloco + TAMANHO_MACRO_BLOCO, total_partes)
 
-                tarefas = [
-                    gerar_parte_sincronizada(
-                        indice=i + j,
-                        total_partes=total_partes,
-                        texto_parte=texto,
-                        voz=voz,
-                        rate=rate,
-                        pitch=pitch,
+                await log_manager.log(
+                    job_id,
+                    f"Iniciando Macro-Bloco {b_idx + 1}/{total_blocos} (partes {inicio_bloco + 1} a {fim_bloco})..."
+                )
+
+                for i in range(inicio_bloco, fim_bloco, tamanho_grupo):
+                    fim_grupo = min(i + tamanho_grupo, fim_bloco)
+                    tarefas = [
+                        gerar_parte_sincronizada(
+                            indice=i + j,
+                            total_partes=total_partes,
+                            texto_parte=texto,
+                            voz=voz,
+                            rate=rate,
+                            pitch=pitch,
+                            job_id=job_id,
+                            semaforo=semaforo_tts
+                        )
+                        for j, texto in enumerate(partes[i : fim_grupo])
+                    ]
+
+                    resultados = await asyncio.gather(*tarefas)
+
+                    for audio_bytes, tempos_parte, duracao_bloco in resultados:
+                        if not audio_bytes:
+                            continue
+
+                        f_mp3.write(audio_bytes)
+
+                        for item in tempos_parte:
+                            inicio_ajustado = round(item["inicio"] + tempo_acumulado, 3)
+                            fim_ajustado = round(item["fim"] + tempo_acumulado, 3)
+
+                            if mapa_completo:
+                                if inicio_ajustado < mapa_completo[-1]["i"]:
+                                    inicio_ajustado = mapa_completo[-1]["i"]
+                                if fim_ajustado < inicio_ajustado:
+                                    fim_ajustado = inicio_ajustado
+
+                            mapa_completo.append({
+                                "p": item["palavra"],
+                                "i": inicio_ajustado,
+                                "f": fim_ajustado
+                            })
+
+                        ultimo_fim = mapa_completo[-1]["f"] if mapa_completo else 0.0
+                        tempo_acumulado = max(round(tempo_acumulado + duracao_bloco, 3), ultimo_fim)
+
+                    f_mp3.flush()
+
+                    porcentagem_calculada = int(10 + (fim_grupo / total_partes) * 85)
+                    await log_manager.progresso(
                         job_id=job_id,
-                        semaforo=semaforo_tts
+                        porcentagem=porcentagem_calculada,
+                        parte_atual=fim_grupo,
+                        total_partes=total_partes,
+                        mensagem=f"Sintetizadas {fim_grupo} de {total_partes} partes ({tempo_acumulado:.1f}s acumulados)"
                     )
-                    for j, texto in enumerate(partes[i : fim_grupo])
-                ]
 
-                resultados = await asyncio.gather(*tarefas)
+                    if fim_grupo < fim_bloco:
+                        await asyncio.sleep(2)
 
-                for audio_bytes, tempos_parte, duracao_bloco in resultados:
-                    if not audio_bytes:
-                        continue
-
-                    f_mp3.write(audio_bytes)
-
-                    for item in tempos_parte:
-                        inicio_ajustado = round(item["inicio"] + tempo_acumulado, 3)
-                        fim_ajustado = round(item["fim"] + tempo_acumulado, 3)
-
-                        if mapa_completo:
-                            # Garante monotonicidade: o tempo 'i' nunca pode ser menor que o anterior
-                            if inicio_ajustado < mapa_completo[-1]["i"]:
-                                inicio_ajustado = mapa_completo[-1]["i"]
-                            if fim_ajustado < inicio_ajustado:
-                                fim_ajustado = inicio_ajustado
-
-                        mapa_completo.append({
-                            "p": item["palavra"],
-                            "i": inicio_ajustado,
-                            "f": fim_ajustado
-                        })
-
-                    ultimo_fim = mapa_completo[-1]["f"] if mapa_completo else 0.0
-                    tempo_acumulado = max(round(tempo_acumulado + duracao_bloco, 3), ultimo_fim)
-
-                f_mp3.flush()
-
-                # Atualiza snapshot do mapa e metadados no disco para permitir consumo imediato
+                # Macro-Bloco concluído: grava snapshot consolidado no disco
                 try:
                     with open(arquivo_mapa, "w", encoding="utf-8") as f_json_snap:
                         json.dump(mapa_completo, f_json_snap, ensure_ascii=False)
                     info_snap = {
-                        "status": "processando",
-                        "liberado_leitura": fim_grupo >= limiar_liberacao,
+                        "status": "concluido" if fim_bloco == total_partes else "processando",
+                        "liberado_leitura": True,
                         "job_id": job_id,
                         "nome_livro": nome_base_livro,
                         "arquivo_original": nome_original,
                         "duracao_segundos": round(tempo_acumulado, 2),
                         "duracao_minutos": round(tempo_acumulado / 60, 2),
-                        "partes_concluidas": fim_grupo,
+                        "bloco_atual": b_idx + 1,
+                        "total_blocos": total_blocos,
+                        "partes_concluidas": fim_bloco,
                         "total_partes": total_partes,
+                        "partes_restantes": total_partes - fim_bloco,
                         "total_palavras": len(mapa_completo),
                         "pagina_inicial": pagina_inicial,
                         "pagina_final": pagina_final,
@@ -643,38 +667,28 @@ async def executar_processamento_livro(
                 except Exception as e_snap:
                     logger.warning(f"Erro ao salvar snapshot incremental: {e_snap}")
 
-                # Se atingiu o limiar de liberação e ainda há mais partes para sintetizar
-                if not ja_liberou_parcial and fim_grupo >= limiar_liberacao and fim_grupo < total_partes:
-                    ja_liberou_parcial = True
-                    msg_liberado = f"🎉 Primeiro trecho pronto para leitura ({round(tempo_acumulado/60, 1)} min disponíveis)! Continuando o restante em segundo plano..."
-                    await log_manager.log(job_id, msg_liberado)
-                    await log_manager.broadcast(job_id, "liberado_parcial", {
-                        "liberado_leitura": True,
-                        "partes_concluidas": fim_grupo,
+                # Notifica que o bloco concluiu (tanto o bloco 1 para liberação quanto os seguintes)
+                msg_bloco = f"✅ Macro-Bloco {b_idx + 1}/{total_blocos} concluído ({fim_bloco}/{total_partes} partes | {round(tempo_acumulado/60, 1)} min disponíveis)!"
+                await log_manager.log(job_id, msg_bloco)
+                await log_manager.broadcast(job_id, "bloco_concluido", info_snap)
+
+                # Se ainda restarem blocos a processar: pausa de resfriamento (cooldown) para zerar rate-limit da Microsoft
+                if fim_bloco < total_partes:
+                    msg_cd = f"⏸️ Pausa de resfriamento de {TEMPO_COOLDOWN_SEGUNDOS}s para respeitar limites da Microsoft... Bloco {b_idx + 2}/{total_blocos} iniciará em breve."
+                    await log_manager.log(job_id, msg_cd, nivel="INFO")
+                    await log_manager.broadcast(job_id, "cooldown", {
+                        "segundos": TEMPO_COOLDOWN_SEGUNDOS,
+                        "proximo_bloco": b_idx + 2,
+                        "total_blocos": total_blocos,
+                        "partes_concluidas": fim_bloco,
                         "total_partes": total_partes,
-                        "duracao_segundos": round(tempo_acumulado, 2),
-                        "duracao_minutos": round(tempo_acumulado / 60, 2),
-                        "total_palavras": len(mapa_completo),
-                        "download_audio_url": download_audio_url,
-                        "download_mapa_url": download_mapa_url,
-                        "nome_livro": nome_base_livro
+                        "partes_restantes": total_partes - fim_bloco
                     })
+                    await asyncio.sleep(TEMPO_COOLDOWN_SEGUNDOS)
 
-                porcentagem_calculada = int(20 + (fim_grupo / total_partes) * 70)
-                await log_manager.progresso(
-                    job_id=job_id,
-                    porcentagem=porcentagem_calculada,
-                    parte_atual=fim_grupo,
-                    total_partes=total_partes,
-                    mensagem=f"Sintetizadas {fim_grupo} de {total_partes} partes ({tempo_acumulado:.1f}s acumulados)"
-                )
-
-                if fim_grupo < total_partes:
-                    await asyncio.sleep(2)  # Pausa breve e segura entre grupos
-
-        # Salva o mapa sincronizado em JSON
-        await log_manager.log(job_id, "Salvando mapa temporal de sincronização e consolidando arquivos...")
-        await log_manager.progresso(job_id, porcentagem=95, parte_atual=total_partes, total_partes=total_partes, mensagem="Consolidando arquivos...")
+        # Salva o mapa final sincronizado em JSON
+        await log_manager.log(job_id, "Processamento de todos os blocos finalizado com sucesso! Consolidando arquivos...")
+        await log_manager.progresso(job_id, porcentagem=100, parte_atual=total_partes, total_partes=total_partes, mensagem="Audiolivro e mapa 100% gerados!")
 
         with open(arquivo_mapa, "w", encoding="utf-8") as f_json:
             json.dump(mapa_completo, f_json, ensure_ascii=False, indent=2)
