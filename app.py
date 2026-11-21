@@ -563,6 +563,11 @@ async def executar_processamento_livro(
         semaforo_tts = asyncio.Semaphore(2)  # Máximo de 2 conexões concorrentes para evitar 429/timeout
         tamanho_grupo = 2
 
+        # Ponto de liberação antecipada (Play While Processing):
+        # Libera após as primeiras 6 partes (~18.000 caracteres / ~20-25 min de áudio em ~45s)
+        limiar_liberacao = min(6, total_partes)
+        ja_liberou_parcial = False
+
         with open(arquivo_mp3, "wb") as f_mp3:
             for i in range(0, total_partes, tamanho_grupo):
                 fim_grupo = min(i + tamanho_grupo, total_partes)
@@ -609,6 +614,51 @@ async def executar_processamento_livro(
 
                     ultimo_fim = mapa_completo[-1]["f"] if mapa_completo else 0.0
                     tempo_acumulado = max(round(tempo_acumulado + duracao_bloco, 3), ultimo_fim)
+
+                f_mp3.flush()
+
+                # Atualiza snapshot do mapa e metadados no disco para permitir consumo imediato
+                try:
+                    with open(arquivo_mapa, "w", encoding="utf-8") as f_json_snap:
+                        json.dump(mapa_completo, f_json_snap, ensure_ascii=False)
+                    info_snap = {
+                        "status": "processando",
+                        "liberado_leitura": fim_grupo >= limiar_liberacao,
+                        "job_id": job_id,
+                        "nome_livro": nome_base_livro,
+                        "arquivo_original": nome_original,
+                        "duracao_segundos": round(tempo_acumulado, 2),
+                        "duracao_minutos": round(tempo_acumulado / 60, 2),
+                        "partes_concluidas": fim_grupo,
+                        "total_partes": total_partes,
+                        "total_palavras": len(mapa_completo),
+                        "pagina_inicial": pagina_inicial,
+                        "pagina_final": pagina_final,
+                        "criado_em": time.time(),
+                        "download_audio_url": download_audio_url,
+                        "download_mapa_url": download_mapa_url,
+                    }
+                    with open(arquivo_info, "w", encoding="utf-8") as f_info_snap:
+                        json.dump(info_snap, f_info_snap, ensure_ascii=False)
+                except Exception as e_snap:
+                    logger.warning(f"Erro ao salvar snapshot incremental: {e_snap}")
+
+                # Se atingiu o limiar de liberação e ainda há mais partes para sintetizar
+                if not ja_liberou_parcial and fim_grupo >= limiar_liberacao and fim_grupo < total_partes:
+                    ja_liberou_parcial = True
+                    msg_liberado = f"🎉 Primeiro trecho pronto para leitura ({round(tempo_acumulado/60, 1)} min disponíveis)! Continuando o restante em segundo plano..."
+                    await log_manager.log(job_id, msg_liberado)
+                    await log_manager.broadcast(job_id, "liberado_parcial", {
+                        "liberado_leitura": True,
+                        "partes_concluidas": fim_grupo,
+                        "total_partes": total_partes,
+                        "duracao_segundos": round(tempo_acumulado, 2),
+                        "duracao_minutos": round(tempo_acumulado / 60, 2),
+                        "total_palavras": len(mapa_completo),
+                        "download_audio_url": download_audio_url,
+                        "download_mapa_url": download_mapa_url,
+                        "nome_livro": nome_base_livro
+                    })
 
                 porcentagem_calculada = int(20 + (fim_grupo / total_partes) * 70)
                 await log_manager.progresso(
@@ -877,7 +927,7 @@ def status_job(job_id: str):
     if arquivo_info.exists():
         with open(arquivo_info, "r", encoding="utf-8") as f:
             dados = json.load(f)
-            return {"status": "concluido", **dados}
+            return dados
 
     if job_id in log_manager.active_jobs or job_id in log_manager.job_history:
         return {
