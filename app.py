@@ -6,6 +6,7 @@ import time
 import uuid
 import shutil
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 from typing import Optional, Union
@@ -274,15 +275,32 @@ def extrair_texto_docx(origem: Union[str, Path, bytes]) -> list[str]:
 
     return paragrafos_originais
 
-def agrupar_em_lotes(paragrafos: list[str], tamanho_lote: int = 10000) -> list[str]:
+def agrupar_em_lotes(paragrafos: list[str], tamanho_lote: int = 3000) -> list[str]:
     """
-    Agrupa os parágrafos em partes de até tamanho_lote caracteres,
+    Agrupa os parágrafos em partes de até tamanho_lote caracteres (padrão otimizado: ~3000 caracteres),
     preservando a quebra de parágrafo dupla ("\n\n").
+    Lotes menores evitam quedas de conexão WebSocket e timeouts com a API da Microsoft.
     """
     partes = []
     bloco_atual = ""
 
     for par in paragrafos:
+        # Se um único parágrafo for maior que o tamanho_lote, divide em frases
+        if len(par) > tamanho_lote:
+            frases = par.split(". ")
+            for fr in frases:
+                fr_limpa = fr.strip()
+                if not fr_limpa:
+                    continue
+                fr_com_ponto = fr_limpa if fr_limpa.endswith((".", "!", "?", ":")) else fr_limpa + "."
+                if len(bloco_atual) + len(fr_com_ponto) < tamanho_lote:
+                    bloco_atual += fr_com_ponto + " "
+                else:
+                    if bloco_atual.strip():
+                        partes.append(bloco_atual.strip())
+                    bloco_atual = fr_com_ponto + " "
+            continue
+
         if len(bloco_atual) + len(par) < tamanho_lote:
             bloco_atual += par + "\n\n"
         else:
@@ -355,8 +373,12 @@ def alinhar_pontuacao_e_paragrafos(texto_com_formatacao: str, tempos_brutos: lis
 
     return mapa_alinhado
 
+# Diretório de Cache Global para Chunks Sintetizados
+CACHE_TTS_DIR = STORAGE_DIR / ".cache_tts"
+CACHE_TTS_DIR.mkdir(parents=True, exist_ok=True)
+
 # ---------------------------------------------------------
-# Síntese Assíncrona via Edge-TTS
+# Síntese Assíncrona via Edge-TTS com Cache e Semáforo
 # ---------------------------------------------------------
 async def gerar_parte_sincronizada(
     indice: int,
@@ -365,62 +387,104 @@ async def gerar_parte_sincronizada(
     voz: str = "pt-BR-AntonioNeural",
     rate: str = "+0%",
     pitch: str = "-5Hz",
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
+    semaforo: Optional[asyncio.Semaphore] = None
 ) -> tuple[bytes, list[dict], float]:
     """
-    Sintetiza uma parte do texto com retry automático e backoff progressivo,
-    capturando eventos de WordBoundary.
+    Sintetiza uma parte do texto com:
+    - Verificação e armazenamento em cache em disco local (SHA-256)
+    - Semáforo para controle estrito de conexões simultâneas
+    - Timeout por requisição para evitar travamento em WebSocket
+    - Retry automático com backoff exponencial
+    - Captura e alinhamento preciso de eventos WordBoundary
     """
-    intervalos_retry = [2, 5, 10, 15]
-    total_tentativas = len(intervalos_retry) + 1
+    # 1. Verifica cache em disco
+    conteudo_hash = hashlib.sha256(f"{texto_parte}|{voz}|{rate}|{pitch}".encode("utf-8")).hexdigest()
+    arquivo_audio_cache = CACHE_TTS_DIR / f"{conteudo_hash}.mp3"
+    arquivo_mapa_cache = CACHE_TTS_DIR / f"{conteudo_hash}.json"
 
-    for tentativa in range(1, total_tentativas + 1):
+    if arquivo_audio_cache.exists() and arquivo_mapa_cache.exists():
         try:
-            comunicador = edge_tts.Communicate(
-                text=texto_parte,
-                voice=voz,
-                rate=rate,
-                pitch=pitch,
-                boundary="WordBoundary"
-            )
-            audio_bytes = bytearray()
-            tempos_brutos = []
+            audio_bytes = arquivo_audio_cache.read_bytes()
+            with open(arquivo_mapa_cache, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+            tempos_formatados = cache_data.get("tempos", [])
+            duracao = cache_data.get("duracao", 0.0)
 
-            async for chunk in comunicador.stream():
-                if chunk["type"] == "audio":
-                    audio_bytes.extend(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
-                    inicio = chunk["offset"] / 10_000_000
-                    duracao = chunk["duration"] / 10_000_000
-                    tempos_brutos.append({
-                        "palavra": chunk["text"],
-                        "inicio": inicio,
-                        "fim": inicio + duracao
-                    })
-
-            if not audio_bytes:
-                raise ValueError("Stream de áudio retornou vazio.")
-
-            mp3_info = MP3(io.BytesIO(audio_bytes))
-            duracao_real_bloco = mp3_info.info.length
-
-            tempos_formatados = alinhar_pontuacao_e_paragrafos(texto_parte, tempos_brutos)
-
-            msg = f"Parte {indice + 1}/{total_partes} concluída ({duracao_real_bloco:.1f}s | {len(tempos_formatados)} palavras)"
+            msg = f"Parte {indice + 1}/{total_partes} recuperada do cache ({duracao:.1f}s | {len(tempos_formatados)} palavras)"
             logger.info(msg)
             if job_id:
                 await log_manager.log(job_id, msg)
+            return audio_bytes, tempos_formatados, duracao
+        except Exception as e_cache:
+            logger.warning(f"Erro ao ler cache do chunk {indice + 1}: {e_cache}")
 
-            return bytes(audio_bytes), tempos_formatados, duracao_real_bloco
+    intervalos_retry = [2, 4, 8, 16]
+    total_tentativas = len(intervalos_retry) + 1
 
-        except Exception as e:
-            espera = intervalos_retry[tentativa - 1] if tentativa <= len(intervalos_retry) else 15
-            msg_aviso = f"Aviso: Tentativa {tentativa}/{total_tentativas} falhou para parte {indice + 1}: {e}. Nova tentativa em {espera}s..."
-            logger.warning(msg_aviso)
-            if job_id:
-                await log_manager.log(job_id, msg_aviso, nivel="WARNING")
-            if tentativa < total_tentativas:
-                await asyncio.sleep(espera)
+    sem_ctx = semaforo if semaforo else asyncio.Semaphore(2)
+
+    async with sem_ctx:
+        for tentativa in range(1, total_tentativas + 1):
+            try:
+                async def _sintetizar():
+                    comunicador = edge_tts.Communicate(
+                        text=texto_parte,
+                        voice=voz,
+                        rate=rate,
+                        pitch=pitch,
+                        boundary="WordBoundary"
+                    )
+                    buf_audio = bytearray()
+                    tempos_raw = []
+
+                    async for chunk in comunicador.stream():
+                        if chunk["type"] == "audio":
+                            buf_audio.extend(chunk["data"])
+                        elif chunk["type"] == "WordBoundary":
+                            inicio = chunk["offset"] / 10_000_000
+                            duracao_pal = chunk["duration"] / 10_000_000
+                            tempos_raw.append({
+                                "palavra": chunk["text"],
+                                "inicio": inicio,
+                                "fim": inicio + duracao_pal
+                            })
+                    return bytes(buf_audio), tempos_raw
+
+                # Timeout estrito de 45 segundos por chunk (~3000 chars normalmente levam 10-15s)
+                audio_bytes, tempos_brutos = await asyncio.wait_for(_sintetizar(), timeout=45.0)
+
+                if not audio_bytes:
+                    raise ValueError("Stream de áudio retornou vazio.")
+
+                mp3_info = MP3(io.BytesIO(audio_bytes))
+                duracao_real_bloco = mp3_info.info.length
+
+                tempos_formatados = alinhar_pontuacao_e_paragrafos(texto_parte, tempos_brutos)
+
+                # Salva no cache para reaproveitamento
+                try:
+                    arquivo_audio_cache.write_bytes(audio_bytes)
+                    with open(arquivo_mapa_cache, "w", encoding="utf-8") as f:
+                        json.dump({"tempos": tempos_formatados, "duracao": duracao_real_bloco}, f)
+                except Exception as e_save_cache:
+                    logger.warning(f"Não foi possível salvar cache do chunk {indice + 1}: {e_save_cache}")
+
+                msg = f"Parte {indice + 1}/{total_partes} concluída ({duracao_real_bloco:.1f}s | {len(tempos_formatados)} palavras)"
+                logger.info(msg)
+                if job_id:
+                    await log_manager.log(job_id, msg)
+
+                return audio_bytes, tempos_formatados, duracao_real_bloco
+
+            except Exception as e:
+                espera = intervalos_retry[tentativa - 1] if tentativa <= len(intervalos_retry) else 16
+                msg_aviso = f"Aviso: Tentativa {tentativa}/{total_tentativas} falhou para parte {indice + 1}: {e}. Nova tentativa em {espera}s..."
+                logger.warning(msg_aviso)
+                if job_id:
+                    await log_manager.log(job_id, msg_aviso, nivel="WARNING")
+                if tentativa < total_tentativas:
+                    await asyncio.sleep(espera)
 
     msg_falha = f"Falha definitiva ao sintetizar parte {indice + 1} após {total_tentativas} tentativas."
     logger.error(msg_falha)
@@ -461,7 +525,10 @@ async def executar_processamento_livro(
     download_mapa_url = f"{base_url}/download/{job_id}/mapa"
 
     try:
-        await log_manager.log(job_id, f"Iniciando processamento do livro '{nome_original}'")
+        msg_inicio = f"Iniciando processamento do livro '{nome_original}'"
+        if pagina_inicial or pagina_final:
+            msg_inicio += f" (Páginas {pagina_inicial or 1} até {pagina_final or 'fim'})"
+        await log_manager.log(job_id, msg_inicio)
         await log_manager.progresso(job_id, porcentagem=5, parte_atual=0, total_partes=0, mensagem="Extraindo texto do documento...")
 
         # 1. Extração do texto (com suporte a streaming direto de arquivo em disco)
@@ -480,20 +547,21 @@ async def executar_processamento_livro(
             origem.unlink(missing_ok=True)
 
         if not paragrafos_originais:
-            raise ValueError("Nenhum texto legível foi encontrado no arquivo fornecido.")
+            raise ValueError("Nenhum texto legível foi encontrado no intervalo especificado do documento.")
 
         await log_manager.log(job_id, f"Extração concluída: {len(paragrafos_originais)} parágrafos encontrados.")
         await log_manager.progresso(job_id, porcentagem=15, parte_atual=0, total_partes=0, mensagem="Dividindo texto em partes otimizadas...")
 
-        # 2. Divisão em lotes
+        # 2. Divisão em lotes com chunking inteligente
         partes = agrupar_em_lotes(paragrafos_originais, tamanho_lote=tamanho_lote)
         total_partes = len(partes)
         await log_manager.log(job_id, f"Texto estruturado e dividido em {total_partes} partes para síntese neural.")
 
-        # 3. Processamento e síntese assíncrona
+        # 3. Processamento e síntese assíncrona controlada por semáforo
         mapa_completo = []
         tempo_acumulado = 0.0
-        tamanho_grupo = 3
+        semaforo_tts = asyncio.Semaphore(2)  # Máximo de 2 conexões concorrentes para evitar 429/timeout
+        tamanho_grupo = 2
 
         with open(arquivo_mp3, "wb") as f_mp3:
             for i in range(0, total_partes, tamanho_grupo):
@@ -508,7 +576,8 @@ async def executar_processamento_livro(
                         voz=voz,
                         rate=rate,
                         pitch=pitch,
-                        job_id=job_id
+                        job_id=job_id,
+                        semaforo=semaforo_tts
                     )
                     for j, texto in enumerate(partes[i : fim_grupo])
                 ]
@@ -551,8 +620,7 @@ async def executar_processamento_livro(
                 )
 
                 if fim_grupo < total_partes:
-                    await log_manager.log(job_id, "Aguardando 5 segundos para respeitar limites do serviço Edge-TTS...")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)  # Pausa breve e segura entre grupos
 
         # Salva o mapa sincronizado em JSON
         await log_manager.log(job_id, "Salvando mapa temporal de sincronização e consolidando arquivos...")
@@ -562,7 +630,7 @@ async def executar_processamento_livro(
             json.dump(mapa_completo, f_json, ensure_ascii=False, indent=2)
 
         info_job = {
-            "status": "sucesso",
+            "status": "concluido",
             "job_id": job_id,
             "nome_livro": nome_base_livro,
             "arquivo_original": nome_original,
@@ -571,6 +639,8 @@ async def executar_processamento_livro(
             "total_paragrafos": len(paragrafos_originais),
             "total_partes": total_partes,
             "total_palavras": len(mapa_completo),
+            "pagina_inicial": pagina_inicial,
+            "pagina_final": pagina_final,
             "criado_em": time.time(),
             "download_audio_url": download_audio_url,
             "download_mapa_url": download_mapa_url,
@@ -582,7 +652,7 @@ async def executar_processamento_livro(
             json.dump(info_job, f_info, ensure_ascii=False, indent=2)
 
         resposta = {
-            "status": "sucesso",
+            "status": "concluido",
             "job_id": job_id,
             "nome_livro": nome_base_livro,
             "duracao_segundos": round(tempo_acumulado, 2),
@@ -653,7 +723,7 @@ async def processar_livro(
     voz: str = Form("pt-BR-AntonioNeural", description="Voz do Edge-TTS"),
     rate: str = Form("+0%", description="Taxa de velocidade (ex: +0%, +10%, -5%)"),
     pitch: str = Form("-5Hz", description="Ajuste de tom (ex: -5Hz, +0Hz)"),
-    tamanho_lote: int = Form(10000, description="Tamanho máximo de caracteres por lote"),
+    tamanho_lote: int = Form(3000, description="Tamanho máximo de caracteres por lote"),
     retornar_mapa_inline: bool = Form(False, description="Se True, inclui a lista completa de palavras e tempos diretamente no JSON de resposta"),
     sync: bool = Form(False, description="Se True, aguarda a conclusão antes de responder (modo bloqueante). Se False (padrão), retorna job_id imediatamente para streaming via SSE.")
 ):
@@ -693,8 +763,6 @@ async def processar_livro(
     # Limpeza periódica de armazenamento
     background_tasks.add_task(limpar_arquivos_antigos)
 
-    # Identificador único do job
-    job_id = uuid.uuid4().hex
     nome_original = Path(file.filename or "livro").stem
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     base_url = f"{proto}://{request.url.netloc}".rstrip("/")
