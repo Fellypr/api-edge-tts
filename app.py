@@ -911,7 +911,12 @@ def baixar_audio(job_id: str):
     return FileResponse(
         path=arquivo_mp3,
         media_type="audio/mpeg",
-        filename=arquivo_mp3.name
+        filename=arquivo_mp3.name,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
     )
 
 @app.get("/download/{job_id}/mapa", tags=["Download"])
@@ -929,7 +934,12 @@ def baixar_mapa(job_id: str):
     return FileResponse(
         path=arquivo_mapa,
         media_type="application/json",
-        filename=arquivo_mapa.name
+        filename=arquivo_mapa.name,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
     )
 
 @app.get("/status/{job_id}", tags=["Status"])
